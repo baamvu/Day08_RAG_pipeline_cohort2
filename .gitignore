@@ -1,0 +1,17 @@
+﻿# Environment
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# Data (large files)
+data/chroma_db/
+data/pageindex_doc_ids.json
+data/landing/legal/*.pdf
+
+# DeepEval cache
+.deepeval/
+
+# OS
+.DS_Store
+Thumbs.db

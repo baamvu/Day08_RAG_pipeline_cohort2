@@ -1,18 +1,25 @@
 """
 Task 5 — Semantic Search Module.
 
-Viết module tìm kiếm ngữ nghĩa (dense retrieval) trên vector store.
-
-Yêu cầu:
-    - Input: query string + top_k
-    - Output: danh sách chunks có score, sorted descending
-    - Phải tương thích với embedding model và vector store ở Task 4
+Dense retrieval sử dụng cosine similarity trên ChromaDB
+với embedding model sentence-transformers/all-MiniLM-L6-v2 (384 dim).
 """
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.task4_chunking_indexing import (
+    EMBEDDING_MODEL,
+    get_chroma_collection,
+    _get_embedding_model,
+)
 
 
 def semantic_search(query: str, top_k: int = 10) -> list[dict]:
     """
-    Tìm kiếm ngữ nghĩa sử dụng vector similarity.
+    Tìm kiếm ngữ nghĩa sử dụng vector similarity (cosine).
 
     Args:
         query: Câu truy vấn
@@ -20,47 +27,42 @@ def semantic_search(query: str, top_k: int = 10) -> list[dict]:
 
     Returns:
         List of {
-            'content': str,      # Nội dung chunk
-            'score': float,      # Cosine similarity score
-            'metadata': dict     # source, doc_type, chunk_index
+            'content': str,
+            'score': float,      # Cosine similarity (0..1, càng cao càng liên quan)
+            'metadata': dict
         }
         Sorted by score descending.
     """
-    # TODO: Implement semantic search
-    #
-    # Bước 1: Embed query bằng cùng model ở Task 4
-    # Bước 2: Query vector store (cosine similarity)
-    # Bước 3: Return top_k results
-    #
-    # Ví dụ với Weaviate:
-    # import weaviate
-    # from sentence_transformers import SentenceTransformer
-    #
-    # model = SentenceTransformer("BAAI/bge-m3")
-    # query_embedding = model.encode(query).tolist()
-    #
-    # client = weaviate.connect_to_local()
-    # collection = client.collections.get("DrugLawDocs")
-    #
-    # results = collection.query.near_vector(
-    #     near_vector=query_embedding,
-    #     limit=top_k,
-    #     return_metadata=MetadataQuery(distance=True)
-    # )
-    #
-    # return [
-    #     {
-    #         "content": obj.properties["content"],
-    #         "score": 1 - obj.metadata.distance,  # distance → similarity
-    #         "metadata": {"source": obj.properties["source"], ...}
-    #     }
-    #     for obj in results.objects
-    # ]
-    raise NotImplementedError("Implement semantic_search")
+    model = _get_embedding_model()
+    query_embedding = model.encode(query, normalize_embeddings=True).tolist()
+
+    collection = get_chroma_collection()
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    output = []
+    if results and results["documents"] and results["documents"][0]:
+        docs = results["documents"][0]
+        metas = results["metadatas"][0]
+        dists = results["distances"][0]
+
+        for doc, meta, dist in zip(docs, metas, dists):
+            # ChromaDB cosine distance = 1 - cosine_similarity
+            similarity = 1.0 - dist
+            output.append({
+                "content": doc,
+                "score": round(similarity, 4),
+                "metadata": meta,
+            })
+
+    output.sort(key=lambda x: x["score"], reverse=True)
+    return output
 
 
 if __name__ == "__main__":
-    # Test
     results = semantic_search("hình phạt cho tội tàng trữ ma tuý", top_k=5)
     for r in results:
-        print(f"[{r['score']:.3f}] {r['content'][:100]}...")
+        print(f"[{r['score']:.3f}] [{r['metadata'].get('source', '?')}] {r['content'][:100]}...")
