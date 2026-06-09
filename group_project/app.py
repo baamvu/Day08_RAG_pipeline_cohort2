@@ -1,5 +1,16 @@
 """
-Group Project — RAG Chatbot với Hybrid Search + Generation + Conversation Memory
+Group Project — RAG Chatbot with Supervisor-Workers Multi-Agent Pattern
+
+Architecture:
+    User Query → Supervisor Agent
+                    │
+                    ├→ Worker 1: Retriever (semantic + lexical → RRF merge)
+                    │
+                    ├→ Worker 2: Reranker (cross-encoder reranking)
+                    │
+                    ├→ [If score < threshold] PageIndex fallback
+                    │
+                    └→ Worker 3: Generator (LLM call with context)
 
 Chạy:
     streamlit run group_project/app.py
@@ -18,18 +29,8 @@ from dotenv import load_dotenv
 
 load_dotenv(ROOT / ".env")
 
-from src.task9_retrieval_pipeline import retrieve
-from src.task10_generation import (
-    reorder_for_llm,
-    format_context,
-    SYSTEM_PROMPT,
-    TEMPERATURE,
-    TOP_P,
-)
+from src.multi_agent.supervisor import Supervisor
 
-# =============================================================================
-# PAGE CONFIG
-# =============================================================================
 st.set_page_config(page_title="DrugLaw Chatbot", page_icon="🤖", layout="wide")
 
 # =============================================================================
@@ -49,7 +50,7 @@ with st.sidebar:
     if mimo_key and mimo_url:
         st.success("Mimo API: Connected")
     else:
-        st.error("Mimo API: Not configured\n\nAdd MIMO_API_KEY + MIMO_BASE_URL to .env")
+        st.error("Mimo API: Not configured")
 
     st.divider()
 
@@ -66,17 +67,40 @@ with st.sidebar:
     except Exception:
         st.warning("Chưa index data")
 
+    st.divider()
+    st.header("🤖 Multi-Agent Architecture")
+    st.markdown("""
+    **Supervisor** orchestrates:
+    1. 🔍 **RetrieverWorker** — semantic + lexical → RRF
+    2. 🔄 **RerankerWorker** — cross-encoder rerank
+    3. 📑 **PageIndex** — fallback if score < threshold
+    4. ✍️ **GeneratorWorker** — LLM generation
+    """)
+
 # =============================================================================
 # SESSION STATE
 # =============================================================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "supervisor" not in st.session_state:
+    st.session_state.supervisor = Supervisor(
+        top_k=top_k,
+        score_threshold=score_threshold,
+        use_reranking=use_reranking,
+    )
+
+# Update supervisor settings if changed
+supervisor = st.session_state.supervisor
+supervisor.top_k = top_k
+supervisor.score_threshold = score_threshold
+supervisor.use_reranking = use_reranking
+
 # =============================================================================
 # HEADER
 # =============================================================================
 st.title("🤖 DrugLaw Chatbot")
-st.caption("Hỏi đáp pháp luật về ma tuý & tin tức nghệ sĩ | Hybrid RAG + Mimo LLM")
+st.caption("Supervisor-Workers Multi-Agent RAG | Hybrid Search + Reranking + Generation")
 
 # =============================================================================
 # DISPLAY CHAT HISTORY
@@ -93,6 +117,10 @@ for msg in st.session_state.messages:
                     emoji = "📜" if t == "legal" else "📰"
                     st.markdown(f"**{emoji} [{i}] {s}** (score: {score:.4f})")
                     st.caption(src["content"][:200] + "...")
+        if msg.get("trace"):
+            with st.expander("🔍 Agent Execution Trace"):
+                for step in msg["trace"]:
+                    st.json(step)
 
 # =============================================================================
 # CHAT INPUT
@@ -100,90 +128,36 @@ for msg in st.session_state.messages:
 query = st.chat_input("Hỏi về pháp luật ma tuý, nghệ sĩ liên quan...")
 
 if query:
-    # Show user message
     st.session_state.messages.append({"role": "user", "content": query})
     with st.chat_message("user"):
         st.markdown(query)
 
-    # Generate answer
     with st.chat_message("assistant"):
-        with st.spinner("Đang tìm kiếm và tạo câu trả lời..."):
-            # Step 1: Retrieve
-            chunks = retrieve(
-                query,
-                top_k=top_k,
-                score_threshold=score_threshold,
-                use_reranking=use_reranking,
-            )
+        with st.spinner("Supervisor đang điều phối workers..."):
+            result = supervisor.run(query)
 
-            if not chunks:
-                answer = "Tôi không tìm thấy thông tin liên quan trong cơ sở dữ liệu. Vui lòng thử câu hỏi khác."
-                st.markdown(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
-            else:
-                # Step 2: Reorder
-                reordered = reorder_for_llm(chunks)
+        st.markdown(result.answer)
 
-                # Step 3: Format context
-                context = format_context(reordered)
+        # Show sources
+        if result.sources:
+            with st.expander(f"📚 Sources ({len(result.sources)} chunks)"):
+                for i, src in enumerate(result.sources, 1):
+                    s = src.get("metadata", {}).get("source", "?")
+                    t = src.get("metadata", {}).get("type", "?")
+                    score = src.get("score", 0)
+                    emoji = "📜" if t == "legal" else "📰"
+                    st.markdown(f"**{emoji} [{i}] {s}** (score: {score:.4f})")
+                    st.caption(src["content"][:200] + "...")
 
-                # Step 4: Build messages with conversation history
-                messages_for_llm = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Show execution trace
+        if result.worker_trace:
+            with st.expander("🔍 Agent Execution Trace"):
+                for step in result.worker_trace:
+                    st.json(step)
 
-                # Add conversation history (last 6 messages for context)
-                for msg in st.session_state.messages[-6:]:
-                    messages_for_llm.append({
-                        "role": msg["role"],
-                        "content": msg["content"],
-                    })
-
-                # Add current query with context
-                user_msg = f"Context:\n{context}\n\n---\n\nQuestion: {query}"
-                messages_for_llm.append({"role": "user", "content": user_msg})
-
-                # Step 5: Call LLM
-                try:
-                    from openai import OpenAI
-
-                    mimo_key = os.getenv("MIMO_API_KEY", "")
-                    mimo_base = os.getenv("MIMO_BASE_URL", "")
-                    mimo_model = os.getenv("MIMO_MODEL", "mimo-v2.5-pro")
-
-                    if mimo_key and mimo_base:
-                        client = OpenAI(api_key=mimo_key, base_url=mimo_base)
-                        model = mimo_model
-                    else:
-                        raise ValueError("No API key configured")
-
-                    response = client.chat.completions.create(
-                        model=model,
-                        messages=messages_for_llm,
-                        temperature=TEMPERATURE,
-                        top_p=TOP_P,
-                        max_tokens=1024,
-                    )
-                    answer = response.choices[0].message.content or ""
-                except Exception as e:
-                    answer = f"Lỗi gọi LLM: {e}\n\nDưới đây là kết quả tìm kiếm thô:\n\n"
-                    for i, c in enumerate(chunks[:3], 1):
-                        answer += f"**[{i}]** {c['content'][:300]}...\n\n"
-
-                # Display answer
-                st.markdown(answer)
-
-                # Display sources
-                with st.expander(f"📚 Sources ({len(chunks)} chunks)"):
-                    for i, src in enumerate(chunks, 1):
-                        s = src.get("metadata", {}).get("source", "?")
-                        t = src.get("metadata", {}).get("type", "?")
-                        score = src.get("score", 0)
-                        emoji = "📜" if t == "legal" else "📰"
-                        st.markdown(f"**{emoji} [{i}] {s}** (score: {score:.4f})")
-                        st.caption(src["content"][:200] + "...")
-
-                # Save to history
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": answer,
-                    "sources": chunks,
-                })
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": result.answer,
+            "sources": result.sources,
+            "trace": result.worker_trace,
+        })
